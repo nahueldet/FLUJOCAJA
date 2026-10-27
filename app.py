@@ -8,8 +8,11 @@ Los datos se guardan en flujo_caja.db (junto a este archivo).
 """
 
 import csv
+import io
 import os
 import sqlite3
+
+import pandas as pd
 from datetime import date, datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flujo_caja.db")
@@ -56,6 +59,7 @@ TIPOS = {
         "fecha_venc": "Fecha de vencimiento",
         "boton_ok": "Marcar cobrado",
         "estado_ok": "Cobrado",
+        "periodo": True,  # permite cargar un período de facturación con varias facturas
     },
     "por_pagar": {
         "titulo": "Cuentas por pagar",
@@ -136,6 +140,13 @@ def conectar(path=DB_PATH):
         )"""
     )
     conn.execute("CREATE TABLE IF NOT EXISTS config (clave TEXT PRIMARY KEY, valor TEXT)")
+    # Migración: bases creadas con versiones anteriores no tienen las columnas de período
+    existentes = {r["name"] for r in conn.execute("PRAGMA table_info(movimientos)")}
+    for col, ddl in (("periodo_desde", "TEXT DEFAULT ''"),
+                     ("periodo_hasta", "TEXT DEFAULT ''"),
+                     ("cant_facturas", "INTEGER DEFAULT 1")):
+        if col not in existentes:
+            conn.execute(f"ALTER TABLE movimientos ADD COLUMN {col} {ddl}")
     conn.commit()
     return conn
 
@@ -150,24 +161,136 @@ def set_saldo_inicial(conn, valor):
     conn.commit()
 
 
-def alta(conn, tipo, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs):
+def alta(conn, tipo, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
+         periodo_desde="", periodo_hasta="", cant_facturas=1):
     cur = conn.execute(
         """INSERT INTO movimientos
-           (tipo, numero, contraparte, banco, fecha_emision, fecha_venc, importe, estado, observaciones)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (tipo, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs),
+           (tipo, numero, contraparte, banco, fecha_emision, fecha_venc, importe, estado, observaciones,
+            periodo_desde, periodo_hasta, cant_facturas)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (tipo, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
+         periodo_desde, periodo_hasta, cant_facturas),
     )
     conn.commit()
     return cur.lastrowid
 
 
-def modificar(conn, id_, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs):
+def modificar(conn, id_, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
+              periodo_desde="", periodo_hasta="", cant_facturas=1):
     conn.execute(
         """UPDATE movimientos SET numero=?, contraparte=?, banco=?, fecha_emision=?,
-           fecha_venc=?, importe=?, estado=?, observaciones=? WHERE id=?""",
-        (numero, contraparte, banco, f_emision, f_venc, importe, estado, obs, id_),
+           fecha_venc=?, importe=?, estado=?, observaciones=?,
+           periodo_desde=?, periodo_hasta=?, cant_facturas=? WHERE id=?""",
+        (numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
+         periodo_desde, periodo_hasta, cant_facturas, id_),
     )
     conn.commit()
+
+
+# --------------------------------------------------------------------------
+# Carga masiva (períodos de facturación de varios clientes de una vez)
+# --------------------------------------------------------------------------
+ALIAS_COLUMNAS = {
+    "cliente": "Cliente", "desde": "Desde", "hasta": "Hasta",
+    "cant. facturas": "Cant", "cantidad": "Cant", "cant": "Cant", "cant facturas": "Cant",
+    "importe total": "Importe", "importe": "Importe",
+    "vencimiento": "Vencimiento", "detalle": "Detalle",
+}
+
+PLANTILLA_CSV = (
+    "Cliente;Desde;Hasta;Cant. facturas;Importe total;Vencimiento;Detalle\n"
+    "Cliente Ejemplo SA;01/10/2026;31/10/2026;5;1.250.000,00;10/11/2026;Facturas 0001-100 a 0001-104\n"
+)
+
+
+def _vacio(v):
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return isinstance(v, str) and not v.strip()
+
+
+def _txt(v):
+    return "" if _vacio(v) else str(v).strip()
+
+
+def _iso(v):
+    """Convierte fecha (date, Timestamp o texto dd/mm/aaaa) a 'aaaa-mm-dd'. Vacío -> ''."""
+    if _vacio(v):
+        return ""
+    if isinstance(v, str):
+        return parse_fecha(v, obligatoria=False)
+    return pd.Timestamp(v).date().isoformat()
+
+
+def _importe(v):
+    if isinstance(v, str):
+        return parse_importe(v)
+    if _vacio(v) or float(v) <= 0:
+        raise ValueError("El importe debe ser mayor a cero.")
+    return round(float(v), 2)
+
+
+def _cant(v):
+    if _vacio(v):
+        return 1
+    n = int(float(v)) if not isinstance(v, str) else int(float(v.replace(",", ".")))
+    if n < 1:
+        raise ValueError("La cantidad de facturas debe ser al menos 1.")
+    return n
+
+
+def leer_csv_masivo(data):
+    """Lee bytes de un CSV (separador ; , o tab) y devuelve lista de dicts."""
+    try:
+        df = pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, encoding="latin-1")
+    return df.to_dict("records")
+
+
+def cargar_masivo(conn, tipo, filas, estado=None):
+    """
+    Inserta varias filas de una vez. Cada fila: dict con Cliente, Desde, Hasta, Cant (o
+    'Cant. facturas'), Importe (o 'Importe total'), Vencimiento, Detalle.
+    Todo o nada: si alguna fila tiene errores no se inserta ninguna.
+    Devuelve (cantidad_insertada, lista_de_errores).
+    """
+    estado = estado or TIPOS[tipo]["estados"][0]
+    hoy = date.today().isoformat()
+    validas, errores = [], []
+    for n, fila in enumerate(filas, start=1):
+        f = {ALIAS_COLUMNAS.get(str(k).strip().lower(), k): v for k, v in fila.items()}
+        if all(_vacio(v) for v in f.values()):
+            continue  # fila totalmente en blanco
+        try:
+            cliente = _txt(f.get("Cliente"))
+            if not cliente:
+                raise ValueError("falta el cliente")
+            try:
+                importe = _importe(f.get("Importe"))
+            except (ValueError, TypeError):
+                raise ValueError("importe inválido o vacío")
+            venc = _iso(f.get("Vencimiento"))
+            if not venc:
+                raise ValueError("falta la fecha de vencimiento")
+            desde, hasta = _iso(f.get("Desde")), _iso(f.get("Hasta"))
+            if desde and hasta and hasta < desde:
+                raise ValueError("el período 'hasta' es anterior al 'desde'")
+            cant = _cant(f.get("Cant"))
+            validas.append((_txt(f.get("Detalle")), cliente, "", hoy, venc, importe, estado, "",
+                            desde, hasta, cant))
+        except (ValueError, TypeError) as e:
+            errores.append(f"Fila {n}: {e}")
+    if errores:
+        return 0, errores
+    for v in validas:
+        alta(conn, tipo, *v)
+    return len(validas), []
 
 
 def cambiar_estado(conn, id_, estado):
@@ -331,34 +454,114 @@ def pagina_flujo():
                                index=[f["etiqueta"] for f in filas]))
 
 
+def flash(msg):
+    st.session_state["_flash"] = msg
+    st.rerun()
+
+
 def pagina_tipo(tipo):
     cfg = TIPOS[tipo]
+    per = cfg.get("periodo", False)
     st.title(cfg["titulo"])
+    if "_flash" in st.session_state:
+        st.success(st.session_state.pop("_flash"))
 
-    # ---- alta ----
+    # ---- alta individual ----
     with st.expander("➕ Agregar nuevo", expanded=False):
         with st.form(f"alta_{tipo}", clear_on_submit=True):
             c = st.columns(3)
-            numero = c[0].text_input(cfg["numero"])
+            numero = c[0].text_input(
+                "Facturas / detalle (opcional)" if per else cfg["numero"],
+                help="Ej: Facturas 0001-100 a 0001-104" if per else None)
             contraparte = c[1].text_input(cfg["contraparte"])
             banco = c[2].text_input("Banco") if cfg["banco"] else ""
-            c = st.columns(3)
-            f_emi = c[0].date_input("Fecha de emisión", value=HOY, format="DD/MM/YYYY")
-            f_venc = c[1].date_input(cfg["fecha_venc"], value=HOY, format="DD/MM/YYYY")
-            importe = c[2].number_input("Importe ($)", min_value=0.0, step=100.0, format="%.2f")
-            c = st.columns([1, 2])
-            estado = c[0].selectbox("Estado", cfg["estados"])
-            obs = c[1].text_input("Observaciones")
+            if per:
+                c = st.columns(4)
+                p_desde = c[0].date_input("Período facturado desde", value=HOY.replace(day=1), format="DD/MM/YYYY")
+                p_hasta = c[1].date_input("Período facturado hasta", value=HOY, format="DD/MM/YYYY")
+                cant = c[2].number_input("Cantidad de facturas", min_value=1, value=1, step=1)
+                importe = c[3].number_input("Importe total del período ($)", min_value=0.0, step=100.0, format="%.2f")
+                c = st.columns(3)
+                f_emi = c[0].date_input("Fecha de emisión (última factura)", value=HOY, format="DD/MM/YYYY")
+                f_venc = c[1].date_input(cfg["fecha_venc"], value=HOY, format="DD/MM/YYYY")
+                estado = c[2].selectbox("Estado", cfg["estados"])
+                obs = st.text_input("Observaciones")
+            else:
+                p_desde = p_hasta = None
+                cant = 1
+                c = st.columns(3)
+                f_emi = c[0].date_input("Fecha de emisión", value=HOY, format="DD/MM/YYYY")
+                f_venc = c[1].date_input(cfg["fecha_venc"], value=HOY, format="DD/MM/YYYY")
+                importe = c[2].number_input("Importe ($)", min_value=0.0, step=100.0, format="%.2f")
+                c = st.columns([1, 2])
+                estado = c[0].selectbox("Estado", cfg["estados"])
+                obs = c[1].text_input("Observaciones")
             if st.form_submit_button("Agregar", type="primary"):
                 if not contraparte.strip():
                     st.error(f"Falta completar: {cfg['contraparte']}.")
                 elif importe <= 0:
                     st.error("El importe debe ser mayor a cero.")
+                elif per and p_hasta < p_desde:
+                    st.error("El período 'hasta' no puede ser anterior al 'desde'.")
                 else:
                     alta(conn, tipo, numero.strip(), contraparte.strip(), banco.strip(),
-                         f_emi.isoformat(), f_venc.isoformat(), round(importe, 2), estado, obs.strip())
-                    st.success("Registro agregado.")
-                    st.rerun()
+                         f_emi.isoformat(), f_venc.isoformat(), round(importe, 2), estado, obs.strip(),
+                         p_desde.isoformat() if per else "", p_hasta.isoformat() if per else "",
+                         int(cant))
+                    flash("Registro agregado.")
+
+    # ---- carga masiva (solo tipos con período) ----
+    if per:
+        with st.expander("📥 Carga masiva de períodos (varios clientes de una vez)"):
+            st.caption("Cada fila = un cliente y un período, con el importe total adeudado en ese período. "
+                       "Podés pegar filas copiadas desde Excel o subir un CSV. "
+                       "Si alguna fila tiene errores no se carga ninguna.")
+            k = st.session_state.setdefault(f"mk_{tipo}", 0)
+            base = pd.DataFrame({
+                "Cliente": pd.Series(dtype="object"),
+                "Desde": pd.Series(dtype="datetime64[ns]"),
+                "Hasta": pd.Series(dtype="datetime64[ns]"),
+                "Cant. facturas": pd.Series(dtype="float64"),
+                "Importe total": pd.Series(dtype="float64"),
+                "Vencimiento": pd.Series(dtype="datetime64[ns]"),
+                "Detalle": pd.Series(dtype="object"),
+            })
+            ed = st.data_editor(
+                base, num_rows="dynamic", hide_index=True, use_container_width=True,
+                key=f"masivo_{tipo}_{k}",
+                column_config={
+                    "Desde": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Vencimiento": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Cant. facturas": st.column_config.NumberColumn(format="%d", min_value=1, step=1),
+                    "Importe total": st.column_config.NumberColumn(format="$ %.2f", min_value=0.01),
+                })
+            if st.button("Cargar filas", type="primary", key=f"btn_masivo_{tipo}"):
+                n, errs = cargar_masivo(conn, tipo, ed.to_dict("records"))
+                if errs:
+                    st.error("No se cargó nada. Corregí estas filas:\n\n- " + "\n- ".join(errs))
+                elif n == 0:
+                    st.info("No hay filas para cargar.")
+                else:
+                    st.session_state[f"mk_{tipo}"] = k + 1
+                    flash(f"{n} períodos cargados.")
+
+            st.markdown("**O subir un archivo CSV**")
+            st.download_button("⬇️ Descargar plantilla CSV", PLANTILLA_CSV.encode("utf-8-sig"),
+                               file_name="plantilla_cuentas_por_cobrar.csv", mime="text/csv",
+                               key=f"tpl_{tipo}")
+            up = st.file_uploader("Archivo CSV", type="csv", key=f"up_{tipo}")
+            if up is not None and st.button("Cargar CSV", key=f"btn_csv_{tipo}"):
+                try:
+                    n, errs = cargar_masivo(conn, tipo, leer_csv_masivo(up.getvalue()))
+                except Exception as e:  # archivo ilegible
+                    n, errs = 0, [f"No se pudo leer el archivo: {e}"]
+                if errs:
+                    st.error("No se cargó nada:\n\n- " + "\n- ".join(errs))
+                elif n == 0:
+                    st.info("El archivo no tiene filas para cargar.")
+                else:
+                    flash(f"{n} períodos cargados desde el CSV.")
 
     # ---- tabla editable ----
     solo = st.checkbox("Solo pendientes", value=True, key=f"solo_{tipo}")
@@ -373,7 +576,9 @@ def pagina_tipo(tipo):
             alerta = "🔴 Vencido" if fv < HOY else ("🟡 Vence en 7 días" if fv <= en7 else "")
         datos.append({
             "id": r["id"], "Alerta": alerta, "Número": r["numero"], "Contraparte": r["contraparte"],
-            "Banco": r["banco"], "Emisión": a_fecha(r["fecha_emision"]), "Vencimiento": fv,
+            "Banco": r["banco"], "Período desde": a_fecha(r["periodo_desde"]),
+            "Período hasta": a_fecha(r["periodo_hasta"]), "Cant. facturas": r["cant_facturas"] or 1,
+            "Emisión": a_fecha(r["fecha_emision"]), "Vencimiento": fv,
             "Importe": r["importe"], "Estado": r["estado"], "Observaciones": r["observaciones"],
             "Eliminar": False,
         })
@@ -381,48 +586,81 @@ def pagina_tipo(tipo):
         st.info("No hay registros para mostrar.")
         return
     df = pd.DataFrame(datos)
-    total = sum(d["Importe"] for d in datos if d["Estado"] == abierto)
-    st.markdown(f"**Total pendiente: $ {fmt_importe(total)}**")
+    pend = [d for d in datos if d["Estado"] == abierto]
+    total = sum(d["Importe"] for d in pend)
+    resumen_txt = f"**Total pendiente: $ {fmt_importe(total)}**"
+    if per:
+        resumen_txt += f"  ·  {sum(d['Cant. facturas'] for d in pend)} facturas en {len(pend)} registros"
+    st.markdown(resumen_txt)
 
-    cols_ocultas = ["id"] + ([] if cfg["banco"] else ["Banco"])
+    ocultas = ["id"]
+    if not cfg["banco"]:
+        ocultas.append("Banco")
+    if not per:
+        ocultas += ["Período desde", "Período hasta", "Cant. facturas"]
     editado = st.data_editor(
         df, key=f"ed_{tipo}", hide_index=True, use_container_width=True,
-        disabled=["id", "Alerta"], column_order=[c for c in df.columns if c not in cols_ocultas],
+        disabled=["id", "Alerta"], column_order=[c for c in df.columns if c not in ocultas],
         column_config={
+            "Período desde": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Período hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Cant. facturas": st.column_config.NumberColumn(format="%d", min_value=1, step=1),
             "Emisión": st.column_config.DateColumn(format="DD/MM/YYYY"),
             "Vencimiento": st.column_config.DateColumn(cfg["fecha_venc"], format="DD/MM/YYYY", required=True),
-            "Importe": st.column_config.NumberColumn(format="$ %.2f", min_value=0.01, required=True),
+            "Importe": st.column_config.NumberColumn(
+                "Importe total" if per else "Importe", format="$ %.2f", min_value=0.01, required=True),
             "Estado": st.column_config.SelectboxColumn(options=cfg["estados"], required=True),
             "Contraparte": st.column_config.TextColumn(cfg["contraparte"]),
-            "Número": st.column_config.TextColumn(cfg["numero"]),
+            "Número": st.column_config.TextColumn("Facturas / detalle" if per else cfg["numero"]),
         })
     st.caption("Editá las celdas directamente (por ejemplo, cambiá el Estado a "
                f"'{cfg['estado_ok']}'), tildá 'Eliminar' para borrar y presioná Guardar cambios.")
 
+    def valores(row):
+        return (_txt(row.get("Número")), _txt(row.get("Contraparte")), _txt(row.get("Banco")),
+                _iso(row.get("Emisión")), _iso(row.get("Vencimiento")),
+                None if _vacio(row.get("Importe")) else round(float(row.get("Importe")), 2),
+                row.get("Estado"), _txt(row.get("Observaciones")),
+                _iso(row.get("Período desde")), _iso(row.get("Período hasta")), _cant(row.get("Cant. facturas")))
+
     c1, c2 = st.columns([1, 1])
     if c1.button("💾 Guardar cambios", type="primary", key=f"save_{tipo}"):
+        originales = {d["id"]: d for d in datos}
         cambios = borrados = 0
+        hubo_error = False
         for _, row in editado.iterrows():
+            rid = int(row["id"])
             if row["Eliminar"]:
-                eliminar(conn, int(row["id"]))
+                eliminar(conn, rid)
                 borrados += 1
                 continue
-            orig = df[df["id"] == row["id"]].iloc[0]
-            if not row.drop(["Eliminar"]).equals(orig.drop(["Eliminar"])):
-                fe = pd.Timestamp(row["Emisión"]).date().isoformat() if pd.notna(row["Emisión"]) else ""
-                fv = pd.Timestamp(row["Vencimiento"]).date().isoformat() if pd.notna(row["Vencimiento"]) else None
-                if not fv or not row["Importe"] or row["Importe"] <= 0:
-                    st.error(f"Fila {int(row['id'])}: faltan fecha o importe válidos.")
-                    continue
-                modificar(conn, int(row["id"]), str(row["Número"] or ""), str(row["Contraparte"] or ""),
-                          str(row["Banco"] or ""), fe, fv, round(float(row["Importe"]), 2),
-                          row["Estado"], str(row["Observaciones"] or ""))
-                cambios += 1
-        st.success(f"{cambios} modificados, {borrados} eliminados.")
-        st.rerun()
+            try:
+                nuevo = valores(row)
+            except (ValueError, TypeError) as e:
+                st.error(f"Registro {rid}: {e}")
+                hubo_error = True
+                continue
+            if nuevo == valores(originales[rid]):
+                continue
+            if not nuevo[4] or not nuevo[5] or nuevo[5] <= 0:
+                st.error(f"Registro {rid}: faltan fecha de vencimiento o importe válido.")
+                hubo_error = True
+                continue
+            if nuevo[8] and nuevo[9] and nuevo[9] < nuevo[8]:
+                st.error(f"Registro {rid}: el período 'hasta' es anterior al 'desde'.")
+                hubo_error = True
+                continue
+            modificar(conn, rid, *nuevo)
+            cambios += 1
+        if hubo_error:
+            st.warning(f"{cambios} modificados, {borrados} eliminados (hay registros con errores sin guardar).")
+        else:
+            flash(f"{cambios} modificados, {borrados} eliminados.")
 
     todos = pd.DataFrame([{
         "Número": r["numero"], "Contraparte": r["contraparte"], "Banco": r["banco"],
+        **({"Período desde": fmt_fecha(r["periodo_desde"]), "Período hasta": fmt_fecha(r["periodo_hasta"]),
+            "Cant. facturas": r["cant_facturas"]} if per else {}),
         "Emisión": fmt_fecha(r["fecha_emision"]), "Vencimiento": fmt_fecha(r["fecha_venc"]),
         "Importe": fmt_importe(r["importe"]), "Estado": r["estado"], "Observaciones": r["observaciones"],
     } for r in listar(conn, tipo)])
