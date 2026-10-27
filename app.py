@@ -8,9 +8,11 @@ Los datos se guardan en flujo_caja.db (junto a este archivo).
 """
 
 import csv
+import difflib
 import io
 import os
 import sqlite3
+import unicodedata
 
 import pandas as pd
 from datetime import date, datetime, timedelta
@@ -152,7 +154,9 @@ def migrar(conn):
     existentes = {r["name"] for r in conn.execute("PRAGMA table_info(movimientos)")}
     for col, ddl in (("periodo_desde", "TEXT DEFAULT ''"),
                      ("periodo_hasta", "TEXT DEFAULT ''"),
-                     ("cant_facturas", "INTEGER DEFAULT 1")):
+                     ("cant_facturas", "INTEGER DEFAULT 1"),
+                     ("aplicado_a", "INTEGER"),    # cuenta que cancela este cheque
+                     ("endosado_a", "INTEGER")):   # cuenta por pagar que cancela (cheque recibido endosado)
         if col not in existentes:
             conn.execute(f"ALTER TABLE movimientos ADD COLUMN {col} {ddl}")
     conn.commit()
@@ -169,27 +173,27 @@ def set_saldo_inicial(conn, valor):
 
 
 def alta(conn, tipo, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
-         periodo_desde="", periodo_hasta="", cant_facturas=1):
+         periodo_desde="", periodo_hasta="", cant_facturas=1, aplicado_a=None, endosado_a=None):
     cur = conn.execute(
         """INSERT INTO movimientos
            (tipo, numero, contraparte, banco, fecha_emision, fecha_venc, importe, estado, observaciones,
-            periodo_desde, periodo_hasta, cant_facturas)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            periodo_desde, periodo_hasta, cant_facturas, aplicado_a, endosado_a)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (tipo, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
-         periodo_desde, periodo_hasta, cant_facturas),
+         periodo_desde, periodo_hasta, cant_facturas, aplicado_a, endosado_a),
     )
     conn.commit()
     return cur.lastrowid
 
 
 def modificar(conn, id_, numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
-              periodo_desde="", periodo_hasta="", cant_facturas=1):
+              periodo_desde="", periodo_hasta="", cant_facturas=1, aplicado_a=None, endosado_a=None):
     conn.execute(
         """UPDATE movimientos SET numero=?, contraparte=?, banco=?, fecha_emision=?,
            fecha_venc=?, importe=?, estado=?, observaciones=?,
-           periodo_desde=?, periodo_hasta=?, cant_facturas=? WHERE id=?""",
+           periodo_desde=?, periodo_hasta=?, cant_facturas=?, aplicado_a=?, endosado_a=? WHERE id=?""",
         (numero, contraparte, banco, f_emision, f_venc, importe, estado, obs,
-         periodo_desde, periodo_hasta, cant_facturas, id_),
+         periodo_desde, periodo_hasta, cant_facturas, aplicado_a, endosado_a, id_),
     )
     conn.commit()
 
@@ -307,6 +311,8 @@ def cambiar_estado(conn, id_, estado):
 
 def eliminar(conn, id_):
     conn.execute("DELETE FROM movimientos WHERE id=?", (id_,))
+    conn.execute("UPDATE movimientos SET aplicado_a=NULL WHERE aplicado_a=?", (id_,))
+    conn.execute("UPDATE movimientos SET endosado_a=NULL WHERE endosado_a=?", (id_,))
     conn.commit()
 
 
@@ -318,6 +324,136 @@ def listar(conn, tipo, solo_abiertos=False):
         params.append(TIPOS[tipo]["estados"][0])
     sql += " ORDER BY fecha_venc, id"
     return conn.execute(sql, params).fetchall()
+
+
+# --------------------------------------------------------------------------
+# Vínculo cheque <-> cuenta: evita contar dos veces el mismo pago
+# --------------------------------------------------------------------------
+# Un cheque recibido que paga una cuenta por cobrar (o un cheque emitido que paga una cuenta
+# por pagar) se vincula a esa cuenta. Entonces:
+#   - la cuenta pasa a valer solo su SALDO = importe - cheques vinculados,
+#   - el cheque cuenta por su importe en su fecha de cobro/pago.
+# Así el mismo dinero se cuenta una sola vez. Los cheques rechazados o anulados no descuentan.
+# Un cheque recibido ENDOSADO a un proveedor cancela una cuenta por pagar (endosado_a).
+CUENTA_DE = {"cheque_recibido": "por_cobrar", "cheque_emitido": "por_pagar"}
+NO_PAGAN = {"cheque_recibido": ("Rechazado",), "cheque_emitido": ("Rechazado", "Anulado")}
+
+
+def aplicados(conn):
+    """{id_cuenta: total cubierto por cheques vinculados}."""
+    out = {}
+    for r in conn.execute("SELECT tipo, estado, importe, aplicado_a, endosado_a FROM movimientos "
+                          "WHERE tipo IN ('cheque_recibido','cheque_emitido')"):
+        if r["aplicado_a"] and r["estado"] not in NO_PAGAN[r["tipo"]]:
+            out[r["aplicado_a"]] = out.get(r["aplicado_a"], 0.0) + r["importe"]
+        if r["tipo"] == "cheque_recibido" and r["endosado_a"] and r["estado"] == "Endosado":
+            out[r["endosado_a"]] = out.get(r["endosado_a"], 0.0) + r["importe"]
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+def movimientos_abiertos(conn):
+    """Lo que realmente falta cobrar/pagar, sin doble conteo: cheques abiertos por su importe
+    y cuentas abiertas por su saldo (importe - cheques vinculados)."""
+    ap = aplicados(conn)
+    out = []
+    for r in conn.execute("SELECT id, tipo, fecha_venc, importe, estado FROM movimientos"):
+        cfg = TIPOS[r["tipo"]]
+        if r["estado"] != cfg["estados"][0]:
+            continue
+        monto = r["importe"]
+        if r["tipo"] in ("por_cobrar", "por_pagar"):
+            monto = round(monto - ap.get(r["id"], 0.0), 2)
+            if monto <= 0:
+                continue
+        out.append({"id": r["id"], "tipo": r["tipo"], "fecha": r["fecha_venc"],
+                    "monto": monto, "ingreso": cfg["ingreso"]})
+    return out
+
+
+def _norm(texto):
+    t = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode().lower()
+    return " ".join(t.split())
+
+
+def _mismo_nombre(a, b):
+    a, b = _norm(a), _norm(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if min(len(a), len(b)) >= 4 and (a in b or b in a):
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
+def cheque_duplicado(conn, tipo, banco, numero, excluir_id=None):
+    """Id de otro cheque del mismo tipo con igual banco y número (o None)."""
+    numero = (numero or "").strip().lower()
+    if not numero:
+        return None
+    r = conn.execute(
+        "SELECT id FROM movimientos WHERE tipo=? AND lower(trim(numero))=? AND lower(trim(banco))=? "
+        "AND id IS NOT ?", (tipo, numero, (banco or "").strip().lower(), excluir_id)).fetchone()
+    return r["id"] if r else None
+
+
+def cuentas_candidatas(conn, tipo_cheque, nombre, ap=None):
+    """Cuentas abiertas con saldo > 0 y mismo nombre que la contraparte del cheque."""
+    ap = aplicados(conn) if ap is None else ap
+    tipo_c = CUENTA_DE[tipo_cheque]
+    out = []
+    for r in conn.execute("SELECT * FROM movimientos WHERE tipo=? AND estado=?",
+                          (tipo_c, TIPOS[tipo_c]["estados"][0])):
+        saldo = round(r["importe"] - ap.get(r["id"], 0.0), 2)
+        if saldo > 0 and _mismo_nombre(nombre, r["contraparte"]):
+            out.append({"id": r["id"], "contraparte": r["contraparte"], "saldo": saldo,
+                        "numero": r["numero"], "fecha": r["fecha_venc"]})
+    return out
+
+
+def controles(conn):
+    """Detecta situaciones donde un mismo pago podría estar contado dos veces."""
+    ap = aplicados(conn)
+    res = {"sin_vincular": [], "sobreaplicadas": [], "cheques_repetidos": [],
+           "endosados_sin_destino": [], "vinculos_rotos": []}
+    cuentas = {r["id"]: r for r in conn.execute(
+        "SELECT * FROM movimientos WHERE tipo IN ('por_cobrar','por_pagar')")}
+    vistos = {}
+    for r in conn.execute("SELECT * FROM movimientos WHERE tipo IN ('cheque_recibido','cheque_emitido') "
+                          "ORDER BY id"):
+        cfg = TIPOS[r["tipo"]]
+        ref = f"N° {r['numero']}" if r["numero"] else f"#{r['id']}"
+        desc = f"Cheque {ref} de {r['contraparte']} por $ {fmt_importe(r['importe'])}"
+        if r["estado"] == cfg["estados"][0] and not r["aplicado_a"]:
+            for c in cuentas_candidatas(conn, r["tipo"], r["contraparte"], ap):
+                igual = " (el monto coincide)" if abs(c["saldo"] - r["importe"]) < 0.005 else ""
+                res["sin_vincular"].append(
+                    f"{desc} no está vinculado a ninguna cuenta, pero {c['contraparte']} tiene la cuenta "
+                    f"#{c['id']} abierta con saldo $ {fmt_importe(c['saldo'])}{igual}. "
+                    "Si es el mismo pago, se está contando dos veces: vinculalo.")
+        if r["tipo"] == "cheque_recibido" and r["estado"] == "Endosado" and not r["endosado_a"]:
+            res["endosados_sin_destino"].append(
+                f"{desc} está endosado pero no indica qué cuenta por pagar cancela (esa deuda sigue "
+                "figurando como pendiente).")
+        for campo, esperado in (("aplicado_a", CUENTA_DE[r["tipo"]]), ("endosado_a", "por_pagar")):
+            idc = r[campo]
+            if idc and (idc not in cuentas or cuentas[idc]["tipo"] != esperado):
+                res["vinculos_rotos"].append(f"{desc} está vinculado a una cuenta (#{idc}) que no existe "
+                                             "o no corresponde.")
+        if r["numero"] and r["numero"].strip():
+            clave = (r["tipo"], _norm(r["banco"]), _norm(r["numero"]))
+            vistos.setdefault(clave, []).append(r["id"])
+    for ids in vistos.values():
+        if len(ids) > 1:
+            res["cheques_repetidos"].append("Hay cheques repetidos (mismo banco y número): registros "
+                                            + ", ".join(f"#{i}" for i in ids) + ".")
+    for cid, total in ap.items():
+        c = cuentas.get(cid)
+        if c and total > c["importe"] + 0.005:
+            res["sobreaplicadas"].append(
+                f"La cuenta #{cid} de {c['contraparte']} es de $ {fmt_importe(c['importe'])} pero tiene "
+                f"cheques vinculados por $ {fmt_importe(total)}: se está pagando de más.")
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -336,21 +472,16 @@ def _siguiente(d, periodo):
 
 
 def resumen(conn, hoy=None):
-    """Totales abiertos por tipo y montos vencidos."""
+    """Totales abiertos por tipo y montos vencidos (sin doble conteo cheque/cuenta)."""
     hoy = (hoy or date.today()).isoformat()
-    out = {}
-    for tipo, cfg in TIPOS.items():
-        abierto = cfg["estados"][0]
-        r = conn.execute(
-            "SELECT COALESCE(SUM(importe),0) t, COUNT(*) n FROM movimientos WHERE tipo=? AND estado=?",
-            (tipo, abierto),
-        ).fetchone()
-        v = conn.execute(
-            "SELECT COALESCE(SUM(importe),0) t, COUNT(*) n FROM movimientos "
-            "WHERE tipo=? AND estado=? AND fecha_venc<?",
-            (tipo, abierto, hoy),
-        ).fetchone()
-        out[tipo] = {"total": r["t"], "cant": r["n"], "vencido": v["t"], "cant_vencido": v["n"]}
+    out = {t: {"total": 0.0, "cant": 0, "vencido": 0.0, "cant_vencido": 0} for t in TIPOS}
+    for m in movimientos_abiertos(conn):
+        o = out[m["tipo"]]
+        o["total"] += m["monto"]
+        o["cant"] += 1
+        if m["fecha"] < hoy:
+            o["vencido"] += m["monto"]
+            o["cant_vencido"] += 1
     return out
 
 
@@ -364,13 +495,7 @@ def proyeccion(conn, periodo="semanal", cantidad=12, hoy=None):
     saldo = get_saldo_inicial(conn)
     saldo0 = saldo
 
-    abiertos = []
-    for tipo, cfg in TIPOS.items():
-        for r in conn.execute(
-            "SELECT fecha_venc, importe FROM movimientos WHERE tipo=? AND estado=?",
-            (tipo, cfg["estados"][0]),
-        ):
-            abiertos.append((r["fecha_venc"], r["importe"], cfg["ingreso"]))
+    abiertos = [(m["fecha"], m["monto"], m["ingreso"]) for m in movimientos_abiertos(conn)]
 
     filas = []
 
@@ -443,6 +568,27 @@ def pagina_flujo():
     venc_egr = r["cheque_emitido"]["vencido"] + r["por_pagar"]["vencido"]
     m[3].metric("Vencido (cobrar / pagar)", f"$ {fmt_importe(venc_ing)} / $ {fmt_importe(venc_egr)}")
 
+    alertas = controles(conn)
+    n_alertas = sum(len(v) for v in alertas.values())
+    titulos = {
+        "sin_vincular": "Cheques sin vincular a una deuda (posible doble conteo)",
+        "sobreaplicadas": "Cuentas con más cheques que su importe",
+        "cheques_repetidos": "Cheques cargados más de una vez",
+        "endosados_sin_destino": "Cheques endosados sin cuenta por pagar",
+        "vinculos_rotos": "Vínculos inválidos",
+    }
+    with st.expander(f"🔍 Control de duplicados: {n_alertas} alerta(s)" if n_alertas
+                     else "🔍 Control de duplicados: sin alertas", expanded=n_alertas > 0):
+        st.caption("Regla: un cheque que paga una deuda se vincula a ella. La deuda baja por ese monto y el "
+                   "cheque cuenta en su fecha de cobro/pago, así el mismo dinero se cuenta una sola vez.")
+        if not n_alertas:
+            st.success("No se detectaron cheques sin vincular ni pagos contados dos veces.")
+        for clave, titulo in titulos.items():
+            if alertas[clave]:
+                st.markdown(f"**{titulo}**")
+                for msg in alertas[clave]:
+                    st.warning(msg)
+
     st.subheader("Resumen por tipo")
     st.dataframe(pd.DataFrame([{
         "Tipo": cfg["titulo"], "Pendientes": r[t]["cant"],
@@ -467,9 +613,51 @@ def flash(msg):
     st.rerun()
 
 
+NINGUNA = "— ninguna —"
+
+
+def etiqueta_cuenta(r):
+    ref = f" · {r['numero']}" if r["numero"] else ""
+    return (f"#{r['id']} · {r['contraparte']}{ref} · $ {fmt_importe(r['importe'])}"
+            f" · vto {fmt_fecha(r['fecha_venc'])}")
+
+
+def opciones_cuentas(tipo_cuenta, incluir=()):
+    """{etiqueta: id} de las cuentas abiertas (y las ya vinculadas, aunque estén cerradas)."""
+    abierto = TIPOS[tipo_cuenta]["estados"][0]
+    res = {}
+    for r in conn.execute("SELECT * FROM movimientos WHERE tipo=? ORDER BY contraparte, fecha_venc, id",
+                          (tipo_cuenta,)):
+        if r["estado"] == abierto or r["id"] in incluir:
+            res[etiqueta_cuenta(r)] = r["id"]
+    return res
+
+
+def aviso_cheque(tipo, contraparte, ap_id):
+    """Advertencia (o '') al cargar un cheque, para no contar dos veces el mismo pago."""
+    if ap_id:
+        c = conn.execute("SELECT importe FROM movimientos WHERE id=?", (ap_id,)).fetchone()
+        if c and aplicados(conn).get(ap_id, 0.0) > c["importe"] + 0.005:
+            return ("\n\n⚠️ Los cheques vinculados a esa cuenta superan su importe. "
+                    "Revisá que no estés cargando el mismo pago dos veces.")
+        return ""
+    cands = cuentas_candidatas(conn, tipo, contraparte)
+    if cands:
+        det = ", ".join(f"#{c['id']} (saldo $ {fmt_importe(c['saldo'])})" for c in cands[:3])
+        return (f"\n\n⚠️ {cands[0]['contraparte']} tiene cuentas abiertas: {det}. Si este cheque las paga, "
+                "vinculalo en la columna 'Cuenta vinculada' de la tabla; si no, el mismo pago "
+                "se cuenta dos veces en el flujo.")
+    return ""
+
+
 def pagina_tipo(tipo):
     cfg = TIPOS[tipo]
     per = cfg.get("periodo", False)
+    es_cheque = tipo in CUENTA_DE
+    es_cuenta = tipo in ("por_cobrar", "por_pagar")
+    if es_cheque:
+        opc_aplica = opciones_cuentas(CUENTA_DE[tipo])
+        opc_endoso = opciones_cuentas("por_pagar") if tipo == "cheque_recibido" else {}
     st.title(cfg["titulo"])
     if "_flash" in st.session_state:
         st.success(st.session_state.pop("_flash"))
@@ -504,6 +692,19 @@ def pagina_tipo(tipo):
                 c = st.columns([1, 2])
                 estado = c[0].selectbox("Estado", cfg["estados"])
                 obs = c[1].text_input("Observaciones")
+            aplica_sel = endoso_sel = NINGUNA
+            if es_cheque:
+                c = st.columns(2)
+                aplica_sel = c[0].selectbox(
+                    "Cobra la cuenta de (evita duplicar el ingreso)" if tipo == "cheque_recibido"
+                    else "Paga la cuenta de (evita duplicar el egreso)",
+                    [NINGUNA] + list(opc_aplica),
+                    help="Si este cheque es el pago de una deuda ya cargada, elegila acá. La deuda baja "
+                         "por el importe del cheque y no se cuenta dos veces.")
+                if tipo == "cheque_recibido":
+                    endoso_sel = c[1].selectbox(
+                        "Si lo endosás: cuenta por pagar que cancela", [NINGUNA] + list(opc_endoso),
+                        help="Solo se aplica cuando el estado es 'Endosado'.")
             if st.form_submit_button("Agregar", type="primary"):
                 if not contraparte.strip():
                     st.error(f"Falta completar: {cfg['contraparte']}.")
@@ -511,12 +712,17 @@ def pagina_tipo(tipo):
                     st.error("El importe debe ser mayor a cero.")
                 elif per and p_hasta < p_desde:
                     st.error("El período 'hasta' no puede ser anterior al 'desde'.")
+                elif es_cheque and cheque_duplicado(conn, tipo, banco.strip(), numero.strip()):
+                    st.error("Ya hay un cheque cargado con ese número y banco. No se cargó para no duplicarlo.")
                 else:
+                    ap_id = opc_aplica.get(aplica_sel) if es_cheque else None
+                    en_id = opc_endoso.get(endoso_sel) if tipo == "cheque_recibido" else None
                     alta(conn, tipo, numero.strip(), contraparte.strip(), banco.strip(),
                          f_emi.isoformat(), f_venc.isoformat(), round(importe, 2), estado, obs.strip(),
                          p_desde.isoformat() if per else "", p_hasta.isoformat() if per else "",
-                         int(cant))
-                    flash("Registro agregado.")
+                         int(cant), ap_id, en_id)
+                    aviso = aviso_cheque(tipo, contraparte.strip(), ap_id) if es_cheque else ""
+                    flash("Registro agregado." + aviso)
 
     # ---- carga masiva (solo tipos con período) ----
     if per:
@@ -576,6 +782,15 @@ def pagina_tipo(tipo):
     rows = listar(conn, tipo, solo)
     abierto = cfg["estados"][0]
     en7 = HOY + timedelta(days=7)
+    ap = aplicados(conn)
+    if es_cheque:
+        mapa_ap = opciones_cuentas(CUENTA_DE[tipo], {r["aplicado_a"] for r in rows if r["aplicado_a"]})
+        mapa_en = (opciones_cuentas("por_pagar", {r["endosado_a"] for r in rows if r["endosado_a"]})
+                   if tipo == "cheque_recibido" else {})
+        inv_ap = {v: k for k, v in mapa_ap.items()}
+        inv_en = {v: k for k, v in mapa_en.items()}
+    else:
+        mapa_ap = mapa_en = {}
     datos = []
     for r in rows:
         fv = a_fecha(r["fecha_venc"])
@@ -590,26 +805,45 @@ def pagina_tipo(tipo):
             "Importe": r["importe"], "Estado": r["estado"], "Observaciones": r["observaciones"],
             "Eliminar": False,
         })
+        if es_cuenta:
+            cub = ap.get(r["id"], 0.0)
+            datos[-1]["Cubierto por cheques"] = cub
+            datos[-1]["Saldo pendiente"] = max(round(r["importe"] - cub, 2), 0.0)
+        if es_cheque:
+            datos[-1]["Cuenta vinculada"] = inv_ap.get(r["aplicado_a"], NINGUNA)
+            if tipo == "cheque_recibido":
+                datos[-1]["Endosado a"] = inv_en.get(r["endosado_a"], NINGUNA)
     if not datos:
         st.info("No hay registros para mostrar.")
         return
     df = pd.DataFrame(datos)
     pend = [d for d in datos if d["Estado"] == abierto]
-    total = sum(d["Importe"] for d in pend)
+    total = sum(d["Saldo pendiente"] if es_cuenta else d["Importe"] for d in pend)
     resumen_txt = f"**Total pendiente: $ {fmt_importe(total)}**"
     if per:
         resumen_txt += f"  ·  {sum(d['Cant. facturas'] for d in pend)} facturas en {len(pend)} registros"
     st.markdown(resumen_txt)
 
-    ocultas = ["id"]
+    ocultas = []
+    if not es_cuenta:
+        ocultas += ["Cubierto por cheques", "Saldo pendiente"]
     if not cfg["banco"]:
         ocultas.append("Banco")
     if not per:
         ocultas += ["Período desde", "Período hasta", "Cant. facturas"]
     editado = st.data_editor(
         df, key=f"ed_{tipo}", hide_index=True, use_container_width=True,
-        disabled=["id", "Alerta"], column_order=[c for c in df.columns if c not in ocultas],
+        disabled=["id", "Alerta", "Cubierto por cheques", "Saldo pendiente"],
+        column_order=[c for c in df.columns if c not in ocultas],
         column_config={
+            "id": st.column_config.NumberColumn("#", format="%d"),
+            "Cubierto por cheques": st.column_config.NumberColumn(format="$ %.2f"),
+            "Saldo pendiente": st.column_config.NumberColumn(format="$ %.2f"),
+            "Cuenta vinculada": st.column_config.SelectboxColumn(
+                "Cobra la cuenta" if tipo == "cheque_recibido" else "Paga la cuenta",
+                options=[NINGUNA] + list(mapa_ap), required=True),
+            "Endosado a": st.column_config.SelectboxColumn(
+                "Endosado a (cuenta por pagar)", options=[NINGUNA] + list(mapa_en), required=True),
             "Período desde": st.column_config.DateColumn(format="DD/MM/YYYY"),
             "Período hasta": st.column_config.DateColumn(format="DD/MM/YYYY"),
             "Cant. facturas": st.column_config.NumberColumn(format="%d", min_value=1, step=1),
@@ -623,19 +857,27 @@ def pagina_tipo(tipo):
         })
     st.caption("Editá las celdas directamente (por ejemplo, cambiá el Estado a "
                f"'{cfg['estado_ok']}'), tildá 'Eliminar' para borrar y presioná Guardar cambios.")
+    if es_cuenta:
+        st.caption("Saldo pendiente = importe − cheques vinculados (los rechazados o anulados no descuentan). "
+                   "Solo el saldo entra al flujo proyectado.")
+    if es_cheque:
+        st.caption("Vinculá cada cheque a la deuda que paga ('Cuenta vinculada'): así la deuda baja y el pago "
+                   "no se cuenta dos veces.")
 
     def valores(row):
         return (_txt(row.get("Número")), _txt(row.get("Contraparte")), _txt(row.get("Banco")),
                 _iso(row.get("Emisión")), _iso(row.get("Vencimiento")),
                 None if _vacio(row.get("Importe")) else round(float(row.get("Importe")), 2),
                 row.get("Estado"), _txt(row.get("Observaciones")),
-                _iso(row.get("Período desde")), _iso(row.get("Período hasta")), _cant(row.get("Cant. facturas")))
+                _iso(row.get("Período desde")), _iso(row.get("Período hasta")), _cant(row.get("Cant. facturas")),
+                mapa_ap.get(row.get("Cuenta vinculada")), mapa_en.get(row.get("Endosado a")))
 
     c1, c2 = st.columns([1, 1])
     if c1.button("💾 Guardar cambios", type="primary", key=f"save_{tipo}"):
         originales = {d["id"]: d for d in datos}
         cambios = borrados = 0
         hubo_error = False
+        tocadas = set()
         for _, row in editado.iterrows():
             rid = int(row["id"])
             if row["Eliminar"]:
@@ -658,17 +900,32 @@ def pagina_tipo(tipo):
                 st.error(f"Registro {rid}: el período 'hasta' es anterior al 'desde'.")
                 hubo_error = True
                 continue
+            if es_cheque and cheque_duplicado(conn, tipo, nuevo[2], nuevo[0], excluir_id=rid):
+                st.error(f"Registro {rid}: ya existe otro cheque con ese número y banco.")
+                hubo_error = True
+                continue
             modificar(conn, rid, *nuevo)
+            tocadas.update(x for x in (nuevo[11], nuevo[12]) if x)
             cambios += 1
         if hubo_error:
             st.warning(f"{cambios} modificados, {borrados} eliminados (hay registros con errores sin guardar).")
         else:
-            flash(f"{cambios} modificados, {borrados} eliminados.")
+            avisos = ""
+            if tocadas:
+                ap2 = aplicados(conn)
+                for cid in tocadas:
+                    cu = conn.execute("SELECT contraparte, importe FROM movimientos WHERE id=?", (cid,)).fetchone()
+                    if cu and ap2.get(cid, 0.0) > cu["importe"] + 0.005:
+                        avisos += (f"\n\n⚠️ La cuenta #{cid} de {cu['contraparte']} quedó con cheques vinculados "
+                                   f"por más que su importe: revisá que no estés pagando de más.")
+            flash(f"{cambios} modificados, {borrados} eliminados." + avisos)
 
     todos = pd.DataFrame([{
         "Número": r["numero"], "Contraparte": r["contraparte"], "Banco": r["banco"],
         **({"Período desde": fmt_fecha(r["periodo_desde"]), "Período hasta": fmt_fecha(r["periodo_hasta"]),
             "Cant. facturas": r["cant_facturas"]} if per else {}),
+        **({"Cuenta vinculada (#)": r["aplicado_a"] or "", "Endosado a (#)": r["endosado_a"] or ""}
+           if es_cheque else {}),
         "Emisión": fmt_fecha(r["fecha_emision"]), "Vencimiento": fmt_fecha(r["fecha_venc"]),
         "Importe": fmt_importe(r["importe"]), "Estado": r["estado"], "Observaciones": r["observaciones"],
     } for r in listar(conn, tipo)])
