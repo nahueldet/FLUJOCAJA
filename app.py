@@ -140,7 +140,15 @@ def conectar(path=DB_PATH):
         )"""
     )
     conn.execute("CREATE TABLE IF NOT EXISTS config (clave TEXT PRIMARY KEY, valor TEXT)")
-    # Migración: bases creadas con versiones anteriores no tienen las columnas de período
+    conn.commit()
+    migrar(conn)
+    return conn
+
+
+def migrar(conn):
+    """Agrega las columnas de período si faltan (bases creadas con versiones anteriores).
+    Es barata e idempotente: se llama también en cada ejecución de la app, porque
+    Streamlit puede conservar una conexión en caché creada con el código viejo."""
     existentes = {r["name"] for r in conn.execute("PRAGMA table_info(movimientos)")}
     for col, ddl in (("periodo_desde", "TEXT DEFAULT ''"),
                      ("periodo_hasta", "TEXT DEFAULT ''"),
@@ -148,7 +156,6 @@ def conectar(path=DB_PATH):
         if col not in existentes:
             conn.execute(f"ALTER TABLE movimientos ADD COLUMN {col} {ddl}")
     conn.commit()
-    return conn
 
 
 def get_saldo_inicial(conn):
@@ -408,6 +415,7 @@ def get_conn():
 
 
 conn = get_conn()
+migrar(conn)  # por si la conexión en caché es anterior a las columnas de período
 HOY = date.today()
 
 
